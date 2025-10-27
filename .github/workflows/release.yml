@@ -1,105 +1,67 @@
 # 工作流名称
-name: Build and Release Minio
+name: Build and Release Minio (Single Job)
 
 # 触发工作流的事件
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 # 设置 GITHUB_TOKEN 的默认权限
-# 需要 'contents: write' 权限来创建 Release 和上传文件
 permissions:
   contents: write
 
 jobs:
-  # 定义一个名为 "build-and-release" 的作业
+  # 定义一个名为 "build-and-release" 的单一作业
   build-and-release:
-    # 指定运行环境为最新的 Ubuntu 系统
     runs-on: ubuntu-latest
     
-    # 定义构建策略，这里使用矩阵（Matrix）来并行构建不同架构
-    strategy:
-      matrix:
-        # 定义一个 go-platform 变量，包含我们想要构建的所有平台和架构
-        go-platform: [linux/amd64, linux/arm64]
-
     steps:
-      # 第一步：检出代码
-      # 使用 actions/checkout@v4 拉取仓库代码
+      # 第一步：检出代码（虽然我们不构建本地代码，但这是 Actions 的标准起始步骤）
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # 第二步：安装和设置 Go 环境
-      # 使用 actions/setup-go@v5 来配置 Go
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 指定 Go 的版本
           go-version: '1.22.x'
-
-      # 第三步：获取平台和架构信息
-      # 从矩阵变量中分离出 GOOS 和 GOARCH
-      - name: Get OS and Arch
-        id: get_platform
-        # 使用 shell 命令将 'linux/amd64' 这样的字符串分割
-        run: |
-          echo "GOOS=$(echo ${{ matrix.go-platform }} | cut -d'/' -f1)" >> $GITHUB_ENV
-          echo "GOARCH=$(echo ${{ matrix.go-platform }} | cut -d'/' -f2)" >> $GITHUB_ENV
-
-      # 第四步：构建 Minio
-      # 这是核心的构建步骤
-      - name: Build Minio for ${{ env.GOOS }}/${{ env.GOARCH }}
-        run: |
-          # 核心构建命令，与你提供的类似，但更规范
-          # -o: 指定输出文件名，方便后续步骤引用
-          # -trimpath: 移除二进制文件中的本地路径信息，使构建可复现
-          # -ldflags "-s -w": 减小二进制文件体积
-          go build -trimpath -ldflags="-s -w" -o minio-${{ env.GOOS }}-${{ env.GOARCH }} github.com/minio/minio@latest
-
-      # 第五步：将构建产物打包上传
-      # 使用 upload-artifact@v4 将构建好的文件保存为临时产物，供后续 Release 步骤使用
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          # 产物的名称，所有矩阵任务都使用同一个名称，这样它们会被收集到一起
-          name: minio-binaries
-          # 要上传的文件路径
-          path: minio-${{ env.GOOS }}-${{ env.GOARCH }}
-
-  # 定义第二个作业 "create-release"，用于创建 Release 并上传文件
-  # 这个作业会在 "build-and-release" 作业成功完成后才运行
-  create-release:
-    runs-on: ubuntu-latest
-    # 'needs' 关键字确保此作业在 'build-and-release' 之后运行
-    needs: build-and-release
-    
-    steps:
-      # 第一步：下载所有构建产物
-      # 使用 download-artifact@v4 将之前上传的所有二进制文件下载到当前工作目录
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: minio-binaries
-          # 下载到名为 "dist" 的文件夹中
-          path: dist/
       
-      # 第二步：(可选) 压缩文件
-      # 遍历 dist 目录下的所有文件，并分别压缩为 tar.gz 格式
-      - name: Compress artifacts
-        run: |
-          cd dist
-          for file in *; do
-            tar -czvf "${file}.tar.gz" "$file"
-          done
-          ls -l # 显示文件列表以供调试
+      # 第三步：创建用于存放构建产物的目录
+      - name: Create release directory
+        run: mkdir release
 
-      # 第三步：创建 GitHub Release 并上传资产
-      # 使用 softprops/action-gh-release@v2 这个非常流行的 action 来完成发布
-      - name: Create Release and Upload Assets
+      # 第四步：使用交叉编译构建所有目标平台
+      - name: Cross-compile for all platforms
+        # 我们在一个步骤中循环构建所有平台
+        run: |
+          # 定义我们要构建的目标平台列表
+          PLATFORMS="linux/amd64 linux/arm64"
+          
+          for platform in $PLATFORMS; do
+            # 从 "linux/amd64" 中分离出 GOOS 和 GOARCH
+            GOOS=${platform%/*}
+            GOARCH=${platform#*/}
+            
+            # 定义输出文件名
+            OUTPUT_NAME="minio-${GOOS}-${GOARCH}"
+            
+            echo "Building for ${GOOS}/${GOARCH}..."
+            
+            # 使用 env 设置环境变量来执行交叉编译
+            # 请注意：我们仍然使用 go install，因为 go build 无法处理远程包语法
+            env GOOS=$GOOS GOARCH=$GOARCH go install -v -trimpath -ldflags="-s -w" github.com/minio/minio@latest
+            
+            # go install 会把文件安装到 GOBIN 目录，我们把它移动到我们的发布目录
+            mv "$(go env GOPATH)/bin/minio" "release/${OUTPUT_NAME}"
+          done
+
+      # 第五步：创建 GitHub Release 并上传所有二进制文件
+      - name: Create Release and Upload Binaries
         uses: softprops/action-gh-release@v2
         with:
-          # 要上传的文件，使用通配符匹配所有 .tar.gz 文件
-          files: dist/*.tar.gz
-          # Release 的名称将基于标签名
+          # 使用通配符上传 release/ 目录下的所有文件
+          files: release/*
           name: Release ${{ github.ref_name }}
-          # 自动生成 Release notes
           generate_release_notes: true
